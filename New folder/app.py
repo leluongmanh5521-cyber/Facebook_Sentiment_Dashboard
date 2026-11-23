@@ -1,10 +1,10 @@
 import os
 import re
+from collections import Counter
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.naive_bayes import MultinomialNB
 
 # Cấu hình trang
 st.set_page_config(
@@ -13,28 +13,59 @@ st.set_page_config(
     layout="wide"
 )
 
+def clean_text(text):
+    text = str(text).lower()
+    text = re.sub(r"http\S+|www\S+|https\S+", "", text)
+    text = re.sub(r"@\w+|#\w+", "", text)
+    text = re.sub(r"[^\w\s]", " ", text)
+    text = re.sub(r"\d+", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+def get_ngrams(text):
+    tokens = clean_text(text).split()
+    bigrams = [f"{tokens[i]}_{tokens[i+1]}" for i in range(len(tokens) - 1)]
+    return tokens + bigrams
+
 @st.cache_data
 def load_data():
     if os.path.exists("Facebook_predictions.csv"):
         df = pd.read_csv("Facebook_predictions.csv")
     elif os.path.exists("Facebook_data_txt.csv"):
         df = pd.read_csv("Facebook_data_txt.csv")
-        # Làm sạch & dự đoán bằng Naive Bayes nếu chưa có cột predicted_sentiment
-        def clean_text(text):
-            text = str(text).lower()
-            text = re.sub(r"http\S+|www\S+|https\S+", "", text)
-            text = re.sub(r"@\w+|#\w+", "", text)
-            text = re.sub(r"[^\w\s]", " ", text)
-            text = re.sub(r"\d+", "", text)
-            return re.sub(r"\s+", " ", text).strip()
+        # Huấn luyện & dự đoán nhanh bằng Multinomial Naive Bayes (NumPy)
+        docs = [get_ngrams(t) for t in df["text"]]
+        vocab_counts = Counter(tok for doc in docs for tok in doc)
+        vocab = {tok: idx for idx, (tok, _) in enumerate(vocab_counts.most_common(5000))}
 
-        clean = df["text"].apply(clean_text)
-        tfidf = TfidfVectorizer(max_features=5000, ngram_range=(1, 2), stop_words="english")
-        X = tfidf.fit_transform(clean)
-        model = MultinomialNB(alpha=1.0).fit(X, df["sentiment"])
-        df["predicted_sentiment"] = model.predict(X)
+        classes = ["negative", "neutral", "positive"]
+        class_counts = np.zeros(len(classes))
+        word_counts = np.zeros((len(classes), len(vocab)))
+
+        for doc, label in zip(docs, df["sentiment"]):
+            if label in classes:
+                c_idx = classes.index(label)
+                class_counts[c_idx] += 1
+                for tok in doc:
+                    idx = vocab.get(tok)
+                    if idx is not None:
+                        word_counts[c_idx, idx] += 1
+
+        log_priors = np.log(class_counts / class_counts.sum())
+        smoothed_wc = word_counts + 1.0
+        log_likelihoods = np.log(smoothed_wc / smoothed_wc.sum(axis=1, keepdims=True))
+
+        preds = []
+        for doc in docs:
+            scores = log_priors.copy()
+            for tok in doc:
+                idx = vocab.get(tok)
+                if idx is not None:
+                    scores += log_likelihoods[:, idx]
+            preds.append(classes[int(np.argmax(scores))])
+
+        df["predicted_sentiment"] = preds
     else:
-        st.error("Không tìm thấy file Facebook_predictions.csv hoặc Facebook_data_txt.csv trong thư mục!")
+        st.error("Không tìm thấy file Facebook_data_txt.csv trong thư mục!")
         st.stop()
     return df
 
@@ -135,7 +166,6 @@ with chart_col2:
     )
     st.plotly_chart(fig_bar, use_container_width=True)
 
-# Bảng thống kê tổng lượt tương tác (bổ sung chi tiết cho yêu cầu c)
 with st.expander("📋 Xem bảng thống kê tổng và trung bình Likes, Comments, Shares"):
     eng_summary = filtered_df.groupby("sentiment")[["likes", "comments", "shares"]].agg(["sum", "mean"]).round(2)
     st.dataframe(eng_summary, use_container_width=True)
